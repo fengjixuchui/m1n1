@@ -6,14 +6,65 @@ from m1n1.utils import *
 
 Ver.set_version(hv.u)
 
-trace_device("/arm-io/sgx", False)
-trace_device("/arm-io/pmp", False)
-trace_device("/arm-io/gfx-asc", False)
+trace_device("/arm-io/sgx", True)
+#trace_device("/arm-io/pmp", True)
+#trace_device("/arm-io/gfx-asc", False)
 
 from m1n1.trace.agx import AGXTracer
 AGXTracer = AGXTracer._reloadcls(True)
 
 agx_tracer = AGXTracer(hv, "/arm-io/gfx-asc", verbose=1)
+agx_tracer.trace_kernmap = False
+agx_tracer.trace_kernva = False
+agx_tracer.trace_usermap = False
+
+sgx = hv.adt["/arm-io/sgx"]
+
+freqs =    []
+voltages = []
+
+for j in range(8):
+    for i, v in enumerate(voltages):
+        if j != 0:
+            v = 1
+        sgx.perf_states[i+j*len(voltages)].freq = freqs[i] * 1000000
+        sgx.perf_states[i+j*len(voltages)].volt = v
+        sgx.perf_states_sram[i+j*len(voltages)].freq = freqs[i] * 1000000
+        sgx.perf_states_sram[i+j*len(voltages)].volt = 1
+        if j >= 1:
+            getattr(sgx, f"perf_states{j}")[i].freq = freqs[i] * 1000000
+            getattr(sgx, f"perf_states{j}")[i].volt = v
+            getattr(sgx, f"perf_states_sram{j}")[i].freq = freqs[i] * 1000000
+            getattr(sgx, f"perf_states_sram{j}")[i].volt = 1
+
+def after_init():
+    plat = hv.adt.compatible[0].lower()
+    fname = f"initdata/{datetime.datetime.now().isoformat()}-{plat}.log"
+    idlog = open(fname, "w")
+    print(f"Platform: {plat}", file=idlog)
+    fw = hv.adt["/chosen"].firmware_version.split(b"\0")[0].decode("ascii")
+    print(f"Firmware: {fw}", file=idlog)
+    sfw = hv.adt["/chosen"].system_firmware_version
+    print(f"System firmware: {sfw}", file=idlog)
+    print(file=idlog)
+
+    print("ADT SGX:", file=idlog)
+    print(sgx, file=idlog)
+    open("adt_hv.txt","w").write(str(hv.adt))
+
+    print("InitData:", file=idlog)
+    print(agx_tracer.state.initdata, file=idlog)
+
+    power = [int(i) for i in agx_tracer.state.initdata.regionB.hwdata_b.rel_max_powers]
+    volt = [int(i[0]) for i in agx_tracer.state.initdata.regionB.hwdata_b.voltages]
+    freq = [int(i) for i in agx_tracer.state.initdata.regionB.hwdata_b.frequencies]
+
+    print("p/v", [p/max(1, v) for p,v in zip(power,volt)])
+    print("p/f", [p/max(1, f) for p,f in zip(power,freq)])
+    print("p/v2", [p/max(1, (v*v)) for p,v in zip(power,volt)])
+    hv.reboot()
+
+agx_tracer.after_init_hook = after_init
 
 #agx_tracer.encoder_id_filter = lambda i: (i >> 16) == 0xc0de
 agx_tracer.start()

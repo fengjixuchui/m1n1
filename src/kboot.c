@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
+#include <stdint.h>
+
 #include "kboot.h"
 #include "adt.h"
 #include "assert.h"
@@ -30,6 +32,8 @@ static int dt_bufsize = 0;
 static void *initrd_start = NULL;
 static size_t initrd_size = 0;
 static char *chosen_params[MAX_CHOSEN_PARAMS][2];
+
+int dt_set_gpu(void *dt);
 
 #define DT_ALIGN 16384
 
@@ -240,7 +244,19 @@ static int dt_set_chosen(void)
 
         // We do not need to reserve the framebuffer, as it will be excluded from the usable RAM
         // range already.
+
+        // save notch height in the dcp node if present
+        if (cur_boot_args.video.height - fb_height) {
+            int dcp = fdt_path_offset(dt, "dcp");
+            if (dcp >= 0)
+                if (fdt_appendprop_u32(dt, dcp, "apple,notch-height",
+                                       cur_boot_args.video.height - fb_height))
+                    printf("FDT: couldn't set apple,notch-height\n");
+        }
     }
+    node = fdt_path_offset(dt, "/chosen");
+    if (node < 0)
+        bail("FDT: /chosen node not found in devtree\n");
 
     int ipd = adt_path_offset(adt, "/arm-io/spi3/ipd");
     if (ipd < 0)
@@ -872,6 +888,22 @@ static int dt_set_atc_tunables(void)
     return 0;
 }
 
+static int dt_get_iommu_node(int node, u32 num)
+{
+    int len;
+    assert(num < 32);
+    const void *prop = fdt_getprop(dt, node, "iommus", &len);
+    if (!prop || len < 0 || (u32)len < 8 * (num + 1)) {
+        printf("FDT: unexpected 'iommus' prop / len %d\n", len);
+        return -FDT_ERR_NOTFOUND;
+    }
+
+    const fdt32_t *iommus = prop;
+    uint32_t phandle = fdt32_ld(&iommus[num * 2]);
+
+    return fdt_node_offset_by_phandle(dt, phandle);
+}
+
 static dart_dev_t *dt_init_dart_by_node(int node, u32 num)
 {
     int len;
@@ -954,6 +986,10 @@ static int dt_carveout_reserved_regions(const char *dcp_alias, const char *disp_
     } region[MAX_DISP_MAPPINGS];
 
     assert(num_maps <= MAX_DISP_MAPPINGS);
+
+    // return early if dcp_alias does not exists
+    if (!fdt_get_alias(dt, dcp_alias))
+        return 0;
 
     int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
     if (node < 0)
@@ -1102,6 +1138,20 @@ static int dt_carveout_reserved_regions(const char *dcp_alias, const char *disp_
         }
     }
 
+    /* enable dart-disp0, it is disabled in device tree to avoid resetting
+     * it and breaking display scanout when booting with old m1n1 which
+     * does not lock dart-disp0.
+     */
+    if (disp_alias) {
+        int disp_node = fdt_path_offset(dt, disp_alias);
+
+        int dart_disp0 = dt_get_iommu_node(disp_node, 0);
+        if (dart_disp0 < 0)
+            bail_cleanup("DT: failed to find 'dart-disp0'\n");
+
+        if (fdt_setprop_string(dt, dart_disp0, "status", "okay") < 0)
+            bail_cleanup("DT: failed to enable 'dart-disp0'\n");
+    }
 err:
     if (dart_dcp)
         dart_shutdown(dart_dcp);
@@ -1124,6 +1174,23 @@ static struct disp_mapping disp_reserved_regions_t8103[] = {
 };
 
 static struct disp_mapping dcpext_reserved_regions_t8103[] = {
+    {"region-id-73", "dcpext_data", true, false, false},
+    {"region-id-74", "region74", true, false, false},
+};
+
+static struct disp_mapping disp_reserved_regions_t8112[] = {
+    {"region-id-49", "dcp_txt", true, false, false},
+    {"region-id-50", "dcp_data", true, false, false},
+    {"region-id-57", "region57", true, false, false},
+    // boot framebuffer, mapped to dart-disp0 sid 0 and dart-dcp sid 5
+    {"region-id-14", "vram", true, true, false},
+    // The 2 following regions are mapped in dart-dcp sid 5 and dart-disp0 sid 0 and 4
+    {"region-id-94", "region94", true, true, false},
+    {"region-id-95", "region95", true, false, true},
+};
+
+static struct disp_mapping dcpext_reserved_regions_t8112[] = {
+    {"region-id-49", "dcp_txt", true, false, false},
     {"region-id-73", "dcpext_data", true, false, false},
     {"region-id-74", "region74", true, false, false},
 };
@@ -1201,6 +1268,15 @@ static int dt_set_display(void)
 
         ret = dt_carveout_reserved_regions("dcpext", NULL, NULL, dcpext_reserved_regions_t8103,
                                            ARRAY_SIZE(dcpext_reserved_regions_t8103));
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8112")) {
+        ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
+                                           disp_reserved_regions_t8112,
+                                           ARRAY_SIZE(disp_reserved_regions_t8112));
+        if (ret)
+            return ret;
+
+        ret = dt_carveout_reserved_regions("dcpext", NULL, NULL, dcpext_reserved_regions_t8112,
+                                           ARRAY_SIZE(dcpext_reserved_regions_t8112));
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6000") ||
                !fdt_node_check_compatible(dt, 0, "apple,t6001") ||
                !fdt_node_check_compatible(dt, 0, "apple,t6002")) {
@@ -1453,6 +1529,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_atc_tunables())
         return -1;
     if (dt_set_display())
+        return -1;
+    if (dt_set_gpu(dt))
         return -1;
     if (dt_disable_missing_devs("usb-drd", "usb@", 8))
         return -1;
