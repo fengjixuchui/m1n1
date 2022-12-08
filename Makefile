@@ -96,6 +96,7 @@ OBJECTS := \
 	display.o \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
+	firmware.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
 	hv.o hv_vm.o hv_exc.o hv_vuart.o hv_wdt.o hv_asm.o hv_aic.o \
@@ -170,7 +171,7 @@ build/%.o: src/%.S
 	@$(AS) -c $(CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
 $(BUILD_FP_OBJS): build/%.o: src/%.c
-	@echo "  CC[FP]  $@"
+	@echo "  CC FP $@"
 	@mkdir -p $(DEPDIR)
 	@mkdir -p "$(dir $@)"
 	@$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
@@ -203,7 +204,7 @@ build/$(NAME).bin: build/$(NAME)-raw.elf
 
 update_tag:
 	@mkdir -p build
-	@echo "#define BUILD_TAG \"$$(git describe --tags --always --dirty)\"" > build/build_tag.tmp
+	@./version.sh > build/build_tag.tmp
 	@cmp -s build/build_tag.h build/build_tag.tmp 2>/dev/null || \
 	( mv -f build/build_tag.tmp build/build_tag.h && echo "  TAG   build/build_tag.h" )
 

@@ -8,6 +8,7 @@
 #include "dapf.h"
 #include "devicetree.h"
 #include "exception.h"
+#include "firmware.h"
 #include "malloc.h"
 #include "memory.h"
 #include "pcie.h"
@@ -32,6 +33,8 @@ static int dt_bufsize = 0;
 static void *initrd_start = NULL;
 static size_t initrd_size = 0;
 static char *chosen_params[MAX_CHOSEN_PARAMS][2];
+
+extern const char *const m1n1_version;
 
 int dt_set_gpu(void *dt);
 
@@ -274,6 +277,25 @@ static int dt_set_chosen(void)
             printf("ADT: kblang-calibration not found, no keyboard layout\n");
         }
     }
+
+    if (fdt_setprop(dt, node, "asahi,iboot1-version", system_firmware.iboot,
+                    strlen(system_firmware.iboot) + 1))
+        bail("FDT: couldn't set asahi,iboot1-version");
+
+    if (fdt_setprop(dt, node, "asahi,system-fw-version", system_firmware.string,
+                    strlen(system_firmware.string) + 1))
+        bail("FDT: couldn't set asahi,system-fw-version");
+
+    if (fdt_setprop(dt, node, "asahi,iboot2-version", os_firmware.iboot,
+                    strlen(os_firmware.iboot) + 1))
+        bail("FDT: couldn't set asahi,iboot2-version");
+
+    if (fdt_setprop(dt, node, "asahi,os-fw-version", os_firmware.string,
+                    strlen(os_firmware.string) + 1))
+        bail("FDT: couldn't set asahi,os-fw-version");
+
+    if (fdt_setprop(dt, node, "asahi,m1n1-stage2-version", m1n1_version, strlen(m1n1_version) + 1))
+        bail("FDT: couldn't set asahi,m1n1-stage2-version");
 
     if (dt_set_rng_seed_sep(node))
         return dt_set_rng_seed_adt(node);
@@ -964,6 +986,78 @@ static int dt_device_set_reserved_mem(int node, dart_dev_t *dart, const char *na
     return 0;
 }
 
+static int dt_get_or_add_reserved_mem(const char *node_name, u64 paddr, size_t size)
+{
+    int ret;
+    int resv_node = fdt_path_offset(dt, "/reserved-memory");
+    if (resv_node < 0)
+        bail("DT: '/reserved-memory' not found\n");
+
+    int node = fdt_subnode_offset(dt, resv_node, node_name);
+    if (node >= 0)
+        return node;
+
+    node = fdt_add_subnode(dt, resv_node, node_name);
+    if (node < 0)
+        bail("DT: failed to add node '%s' to  '/reserved-memory'\n", node_name);
+
+    uint32_t phandle;
+    ret = fdt_generate_phandle(dt, &phandle);
+    if (ret)
+        bail("DT: failed to generate phandle: %d\n", ret);
+
+    ret = fdt_setprop_u32(dt, node, "phandle", phandle);
+    if (ret != 0)
+        bail("DT: couldn't set '%s.phandle' property: %d\n", node_name, ret);
+
+    u64 reg[2] = {cpu_to_fdt64(paddr), cpu_to_fdt64(size)};
+    ret = fdt_setprop(dt, node, "reg", reg, sizeof(reg));
+    if (ret != 0)
+        bail("DT: couldn't set '%s.reg' property: %d\n", node_name, ret);
+
+    ret = fdt_setprop_string(dt, node, "compatible", "apple,resv-mem");
+    if (ret != 0)
+        bail("DT: couldn't set '%s.compatible' property: %d\n", node_name, ret);
+
+    ret = fdt_setprop_empty(dt, node, "no-map");
+    if (ret != 0)
+        bail("DT: couldn't set '%s.no-map' property: %d\n", node_name, ret);
+
+    return node;
+}
+
+static int dt_set_dcp_firmware(const char *alias)
+{
+    const char *path = fdt_get_alias(dt, alias);
+
+    if (!path)
+        return 0;
+
+    int node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return 0;
+
+    if (firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) < 0)
+        bail("FDT: Could not set apple,firmware-version for %s\n", path);
+
+    const struct fw_version_info *compat;
+
+    switch (os_firmware.version) {
+        case V12_3_1:
+        case V12_4:
+            compat = &fw_versions[V12_3];
+            break;
+        default:
+            compat = &os_firmware;
+            break;
+    }
+
+    if (firmware_set_fdt(dt, node, "apple,firmware-compat", compat) < 0)
+        bail("FDT: Could not set apple,firmware-compat for %s\n", path);
+
+    return 0;
+}
+
 struct disp_mapping {
     char region_adt[24];
     char mem_fdt[24];
@@ -990,6 +1084,10 @@ static int dt_carveout_reserved_regions(const char *dcp_alias, const char *disp_
     // return early if dcp_alias does not exists
     if (!fdt_get_alias(dt, dcp_alias))
         return 0;
+
+    ret = dt_set_dcp_firmware(dcp_alias);
+    if (ret)
+        return ret;
 
     int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
     if (node < 0)
@@ -1055,41 +1153,16 @@ static int dt_carveout_reserved_regions(const char *dcp_alias, const char *disp_
         piodma_phandle = fdt_get_phandle(dt, piodma_node);
     }
 
-    uint32_t max_phandle;
-    ret = fdt_find_max_phandle(dt, &max_phandle);
-    if (ret)
-        bail_cleanup("DT: failed to get max phandle: %d\n", ret);
-
     for (unsigned i = 0; i < num_maps; i++) {
         const char *name = maps[i].mem_fdt;
         char node_name[64];
 
-        int resv_node = fdt_path_offset(dt, "/reserved-memory");
-        if (resv_node < 0)
-            bail_cleanup("DT: '/reserved-memory' not found\n");
-
         snprintf(node_name, sizeof(node_name), "%s@%lx", name, region[i].paddr);
-        int mem_node = fdt_add_subnode(dt, resv_node, node_name);
+        int mem_node = dt_get_or_add_reserved_mem(node_name, region[i].paddr, region[i].size);
         if (mem_node < 0)
-            bail_cleanup("DT: failed to add '%s' /reserved-memory subnode: %d\n", node_name, ret);
+            goto err;
 
-        uint32_t mem_phandle = ++max_phandle;
-        ret = fdt_setprop_u32(dt, mem_node, "phandle", mem_phandle);
-        if (ret != 0)
-            bail_cleanup("DT: couldn't set '%s.phandle' property: %d\n", node_name, ret);
-
-        u64 reg[2] = {cpu_to_fdt64(region[i].paddr), cpu_to_fdt64(region[i].size)};
-        ret = fdt_setprop(dt, mem_node, "reg", reg, sizeof(reg));
-        if (ret != 0)
-            bail_cleanup("DT: couldn't set '%s.reg' property: %d\n", node_name, ret);
-
-        ret = fdt_setprop_string(dt, mem_node, "compatible", "apple,dcp");
-        if (ret != 0)
-            bail_cleanup("DT: couldn't set '%s.compatible' property: %d\n", node_name, ret);
-
-        ret = fdt_setprop_empty(dt, mem_node, "no-map");
-        if (ret != 0)
-            bail_cleanup("DT: couldn't set '%s.no-map' property: %d\n", node_name, ret);
+        uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         if (maps[i].map_dcp && dart_dcp) {
             ret = dt_device_set_reserved_mem(mem_node, dart_dcp, node_name, dcp_phandle,
@@ -1259,6 +1332,7 @@ static int dt_set_display(void)
      * they are missing. */
 
     int ret = 0;
+
     if (!fdt_node_check_compatible(dt, 0, "apple,t8103")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t8103,
