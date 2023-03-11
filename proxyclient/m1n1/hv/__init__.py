@@ -13,6 +13,8 @@ from .. import xnutools, shell
 
 from .gdbserver import *
 from .types import *
+from .virtutils import *
+from .virtio import *
 
 __all__ = ["HV"]
 
@@ -111,6 +113,7 @@ class HV(Reloadable):
         self.hvcall_handlers = {}
         self.switching_context = False
         self.show_timestamps = False
+        self.virtio_devs = {}
 
     def _reloadme(self):
         super()._reloadme()
@@ -492,6 +495,10 @@ class HV(Reloadable):
             raise Exception(f"VM hook with unexpected mapping at {data.addr:#x}: {maps[0][0].name}")
 
         if not data.flags.WRITE:
+            if mode == TraceMode.HOOK and not read:
+                mode = TraceMode.SYNC
+                first += 1
+
             if mode == TraceMode.HOOK:
                 val = self.shellwrap(lambda: read(data.addr, 8 << data.flags.WIDTH, **kwargs),
                                      f"Tracer {ident}:read (HOOK)", update=do_update, needs_ret=True)
@@ -550,6 +557,9 @@ class HV(Reloadable):
                 wval = val[0]
             else:
                 wval = val
+
+            if mode == TraceMode.HOOK and not write:
+                mode = TraceMode.SYNC
 
             if mode == TraceMode.HOOK:
                 self.shellwrap(lambda: write(data.addr, wval, 8 << data.flags.WIDTH, **kwargs),
@@ -999,6 +1009,71 @@ class HV(Reloadable):
 
         self.p.exit(0)
 
+    def attach_virtio(self, dev, base=None, irq=None, verbose=False):
+        if base is None:
+            base = alloc_mmio_base(self.adt, 0x1000)
+        if irq is None:
+            irq = alloc_aic_irq(self.adt)
+
+        data = dev.config_data
+        data_base = self.u.heap.malloc(len(data))
+        self.iface.writemem(data_base, data)
+
+        config = VirtioConfig.build({
+            "irq": irq,
+            "devid": dev.devid,
+            "feats": dev.feats,
+            "num_qus": dev.num_qus,
+            "data": data_base,
+            "data_len": len(data),
+            "verbose": verbose,
+        })
+
+        config_base = self.u.heap.malloc(len(config))
+        self.iface.writemem(config_base, config)
+
+        name = None
+        for i in range(16):
+            n = "/arm-io/virtio%d" % i
+            if n not in self.adt:
+                name = n
+                break
+        if name is None:
+            raise ValueError("Too many virtios in ADT")
+
+        print(f"Adding {n} @ 0x{base:x}, irq {irq}")
+
+        node = self.adt.create_node(name)
+        node.reg = [Container(addr=node.to_bus_addr(base), size=0x1000)]
+        node.interrupt_parent = getattr(self.adt["/arm-io/aic"], "AAPL,phandle")
+        node.interrupts = (irq,)
+        node.compatible = ["virtio,mmio"]
+
+        self.p.hv_map_virtio(base, config_base)
+        self.add_tracer(irange(base, 0x1000), "VIRTIO", TraceMode.RESERVED)
+
+        dev.base = base
+        dev.hv = self
+        self.virtio_devs[base] = dev
+
+    def handle_virtio(self, reason, code, info):
+        ctx = self.iface.readstruct(info, ExcInfo)
+        self.virtio_ctx = info = self.iface.readstruct(ctx.data, VirtioExcInfo)
+
+        try:
+            handled = self.virtio_devs[info.devbase].handle_exc(info)
+        except:
+            self.log(f"Python exception from within virtio handler")
+            traceback.print_exc()
+            handled = False
+
+        if not handled:
+            signal.signal(signal.SIGINT, self.default_sigint)
+            self.run_shell("Entering hypervisor shell", "Returning")
+            signal.signal(signal.SIGINT, self._handle_sigint)
+
+        self.p.exit(EXC_RET.HANDLED)
+
     def skip(self):
         self.ctx.elr += 4
         self.cont()
@@ -1299,6 +1374,7 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.VTIMER, self.handle_exception)
         self.iface.set_handler(START.HV, HV_EVENT.WDT_BARK, self.handle_bark)
         self.iface.set_handler(START.HV, HV_EVENT.CPU_SWITCH, self.handle_exception)
+        self.iface.set_handler(START.HV, HV_EVENT.VIRTIO, self.handle_virtio)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)
 
