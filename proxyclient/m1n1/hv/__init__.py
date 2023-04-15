@@ -1463,8 +1463,9 @@ class HV(Reloadable):
             return ret
 
         atc = f"ATC{self.iodev - IODEV.USB0}_USB"
+        atc_aon = f"ATC{self.iodev - IODEV.USB0}_USB_AON"
 
-        hook_devs = ["UART0", atc]
+        hook_devs = ["UART0", atc, atc_aon]
 
         pmgr = self.adt["/arm-io/pmgr"]
         dev_by_name = {dev.name: dev for dev in pmgr.devices}
@@ -1514,10 +1515,13 @@ class HV(Reloadable):
         die_count = self.adt["/arm-io"].die_count if hasattr(self.adt["/arm-io"], "die-count") else 1
 
         for die in range(0, die_count):
-            if self.u.adt["/chosen"].chip_id in (0x8103, 0x6000, 0x6001, 0x6002):
+            chip_id = self.u.adt["/chosen"].chip_id
+            if chip_id in (0x8103, 0x6000, 0x6001, 0x6002):
                 cpu_start = 0x54000 + die * 0x20_0000_0000
-            elif self.u.adt["/chosen"].chip_id in (0x8112,):
+            elif chip_id in (0x8112,):
                 cpu_start = 0x34000 + die * 0x20_0000_0000
+            elif chip_id in (0x6020, 0x6021):
+                cpu_start = 0x28000 + die * 0x20_0000_0000
             else:
                 self.log("CPUSTART unknown for this SoC!")
                 break
